@@ -1269,14 +1269,6 @@ int linenoiseEditStart(struct linenoiseState *l, int stdin_fd, int stdout_fd, ch
     l->oldpos = l->pos = 0;
     l->len = 0;
 
-    /* Enter raw mode. */
-    if (enableRawMode(l->ifd) == -1) return -1;
-
-    l->cols = getColumns(stdin_fd, stdout_fd);
-    l->oldrows = 0;
-    l->oldrpos = 1;  /* Cursor starts on row 1. */
-    l->history_index = 0;
-
     /* Buffer starts empty. */
     l->buf[0] = '\0';
     l->buflen--; /* Make sure there is always space for the nulterm */
@@ -1285,6 +1277,14 @@ int linenoiseEditStart(struct linenoiseState *l, int stdin_fd, int stdout_fd, ch
      * will actually just read a line from standard input in blocking
      * mode later, in linenoiseEditFeed(). */
     if (!isatty(l->ifd) && !getenv("LINENOISE_ASSUME_TTY")) return 0;
+
+    /* Enter raw mode. */
+    if (enableRawMode(l->ifd) == -1) return -1;
+
+    l->cols = getColumns(stdin_fd, stdout_fd);
+    l->oldrows = 0;
+    l->oldrpos = 1;  /* Cursor starts on row 1. */
+    l->history_index = 0;
 
     /* The latest history entry is always our current buffer, that
      * initially is just an empty string. */
