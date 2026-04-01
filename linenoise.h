@@ -59,7 +59,8 @@ struct linenoiseState {
     char *buf;          /* Edited line buffer. */
     size_t buflen;      /* Edited line buffer size. */
     const char *prompt; /* Prompt to display. */
-    size_t plen;        /* Prompt length. */
+    size_t plen;        /* Prompt length (bytes). */
+    size_t pwidthDisplay; /* Prompt display width (ANSI-aware). */
     size_t pos;         /* Current cursor position. */
     size_t oldpos;      /* Previous refresh cursor position. */
     size_t len;         /* Current edited line length. */
@@ -67,6 +68,8 @@ struct linenoiseState {
     size_t oldrows;     /* Rows used by last refrehsed line (multiline mode) */
     int oldrpos;        /* Cursor row from last refresh (for multiline clearing). */
     int history_index;  /* The history index we are currently editing. */
+    const char *rprompt; /* Right prompt (may contain ANSI). */
+    size_t rpromptlen;   /* Right prompt byte length. */
 };
 
 typedef struct linenoiseCompletions {
@@ -89,10 +92,13 @@ void linenoiseFree(void *ptr);
 typedef void(linenoiseCompletionCallback)(const char *, linenoiseCompletions *);
 typedef char*(linenoiseHintsCallback)(const char *, int *color, int *bold);
 typedef void(linenoiseFreeHintsCallback)(void *);
+typedef void(linenoiseColorizeCallback)(const char *buf, char *colorized, size_t maxlen, size_t *out_len);
 void linenoiseSetCompletionCallback(linenoiseCompletionCallback *);
 void linenoiseSetHintsCallback(linenoiseHintsCallback *);
 void linenoiseSetFreeHintsCallback(linenoiseFreeHintsCallback *);
+void linenoiseSetColorizeCallback(linenoiseColorizeCallback *);
 void linenoiseAddCompletion(linenoiseCompletions *, const char *);
+void linenoiseSetRightPrompt(struct linenoiseState *l, const char *rprompt);
 
 /* History API. */
 int linenoiseHistoryAdd(const char *line);

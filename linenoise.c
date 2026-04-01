@@ -124,6 +124,7 @@ static char *unsupported_term[] = {"dumb","cons25","emacs",NULL};
 static linenoiseCompletionCallback *completionCallback = NULL;
 static linenoiseHintsCallback *hintsCallback = NULL;
 static linenoiseFreeHintsCallback *freeHintsCallback = NULL;
+static linenoiseColorizeCallback *colorizeCallback = NULL;
 static char *linenoiseNoTTY(void);
 static void refreshLineWithCompletion(struct linenoiseState *ls, linenoiseCompletions *lc, int flags);
 static void refreshLineWithFlags(struct linenoiseState *l, int flags);
@@ -433,6 +434,45 @@ static size_t utf8StrWidth(const char *s, size_t len) {
             after_zwj = 1;
         }
 
+        i += clen;
+    }
+    return width;
+}
+
+/* Like utf8StrWidth() but skips ANSI escape sequences (CSI SGR and OSC).
+ * Used for prompt width calculation where the prompt may contain colors. */
+static size_t utf8StrWidthAnsi(const char *s, size_t len) {
+    size_t width = 0;
+    size_t i = 0;
+    int after_zwj = 0;
+
+    while (i < len) {
+        /* Skip CSI sequences: ESC [ ... (final byte 0x40-0x7E) */
+        if (i + 1 < len && (unsigned char)s[i] == 0x1b && s[i+1] == '[') {
+            i += 2;
+            while (i < len && (unsigned char)s[i] < 0x40) i++;
+            if (i < len) i++; /* skip final byte */
+            continue;
+        }
+        /* Skip OSC sequences: ESC ] ... BEL  or  ESC ] ... ESC \\ */
+        if (i + 1 < len && (unsigned char)s[i] == 0x1b && s[i+1] == ']') {
+            i += 2;
+            while (i < len) {
+                if ((unsigned char)s[i] == 0x07) { i++; break; }
+                if ((unsigned char)s[i] == 0x1b && i + 1 < len && s[i+1] == '\\') { i += 2; break; }
+                i++;
+            }
+            continue;
+        }
+
+        size_t clen;
+        uint32_t cp = utf8DecodeChar(s + i, &clen);
+        if (after_zwj) {
+            after_zwj = 0;
+        } else {
+            width += utf8CharWidth(cp);
+        }
+        if (isZWJ(cp)) after_zwj = 1;
         i += clen;
     }
     return width;
@@ -782,6 +822,15 @@ void linenoiseSetFreeHintsCallback(linenoiseFreeHintsCallback *fn) {
     freeHintsCallback = fn;
 }
 
+void linenoiseSetColorizeCallback(linenoiseColorizeCallback *fn) {
+    colorizeCallback = fn;
+}
+
+void linenoiseSetRightPrompt(struct linenoiseState *l, const char *rprompt) {
+    l->rprompt = rprompt;
+    l->rpromptlen = rprompt ? strlen(rprompt) : 0;
+}
+
 /* This function is used by the callback function registered by the user
  * in order to add completion options given the input string when the
  * user typed <tab>. See the example.c source code for a very easy to
@@ -882,7 +931,7 @@ void refreshShowHints(struct abuf *ab, struct linenoiseState *l, int pwidth) {
  * for cursor positioning and horizontal scrolling. */
 static void refreshSingleLine(struct linenoiseState *l, int flags) {
     char seq[64];
-    size_t pwidth = utf8StrWidth(l->prompt, l->plen); /* Prompt display width */
+    size_t pwidth = l->pwidthDisplay; /* ANSI-aware prompt display width */
     int fd = l->ofd;
     char *buf = l->buf;
     size_t len = l->len;    /* Byte length of buffer to display */
@@ -917,6 +966,8 @@ static void refreshSingleLine(struct linenoiseState *l, int flags) {
     }
 
     abInit(&ab);
+    /* Synchronized rendering: begin. */
+    abAppend(&ab,"\x1b[?2026h",8);
     /* Cursor to left edge */
     snprintf(seq,sizeof(seq),"\r");
     abAppend(&ab,seq,strlen(seq));
@@ -931,6 +982,12 @@ static void refreshSingleLine(struct linenoiseState *l, int flags) {
                 abAppend(&ab,"*",1);
                 i += utf8NextCharLen(buf, i, len);
             }
+        } else if (colorizeCallback) {
+            /* Colorize mode: get ANSI-decorated buffer for display. */
+            char colorized[16384];
+            size_t colorized_len = 0;
+            colorizeCallback(buf, colorized, sizeof(colorized), &colorized_len);
+            abAppend(&ab, colorized, colorized_len);
         } else {
             abAppend(&ab,buf,len);
         }
@@ -943,10 +1000,24 @@ static void refreshSingleLine(struct linenoiseState *l, int flags) {
     abAppend(&ab,seq,strlen(seq));
 
     if (flags & REFRESH_WRITE) {
+        /* Right prompt: render right-aligned if it fits. */
+        if (l->rprompt && l->rpromptlen > 0) {
+            size_t rpwidth = utf8StrWidthAnsi(l->rprompt, l->rpromptlen);
+            size_t used = pwidth + lencol;
+            if (used + rpwidth + 1 <= l->cols) {
+                size_t rpos = l->cols - rpwidth;
+                snprintf(seq, sizeof(seq), "\x1b[%dG", (int)(rpos + 1));
+                abAppend(&ab, seq, strlen(seq));
+                abAppend(&ab, l->rprompt, l->rpromptlen);
+            }
+        }
         /* Move cursor to original position (using display column, not byte). */
         snprintf(seq,sizeof(seq),"\r\x1b[%dC", (int)(poscol+pwidth));
         abAppend(&ab,seq,strlen(seq));
     }
+
+    /* Synchronized rendering: end. */
+    abAppend(&ab,"\x1b[?2026l",8);
 
     if (write(fd,ab.b,ab.len) == -1) {} /* Can't recover from write error. */
     abFree(&ab);
@@ -963,7 +1034,7 @@ static void refreshSingleLine(struct linenoiseState *l, int flags) {
  * This function is UTF-8 aware and uses display widths for positioning. */
 static void refreshMultiLine(struct linenoiseState *l, int flags) {
     char seq[64];
-    size_t pwidth = utf8StrWidth(l->prompt, l->plen);  /* Prompt display width */
+    size_t pwidth = l->pwidthDisplay;  /* ANSI-aware prompt display width */
     size_t bufwidth = utf8StrWidth(l->buf, l->len);    /* Buffer display width */
     size_t poswidth = utf8StrWidth(l->buf, l->pos);    /* Cursor display width */
     int rows = (pwidth+bufwidth+l->cols-1)/l->cols;    /* rows used by current buf. */
@@ -979,6 +1050,8 @@ static void refreshMultiLine(struct linenoiseState *l, int flags) {
     /* First step: clear all the lines used before. To do so start by
      * going to the last row. */
     abInit(&ab);
+    /* Synchronized rendering: begin. */
+    abAppend(&ab,"\x1b[?2026h",8);
 
     if (flags & REFRESH_CLEAN) {
         if (old_rows-rpos > 0) {
@@ -1012,6 +1085,11 @@ static void refreshMultiLine(struct linenoiseState *l, int flags) {
                 abAppend(&ab,"*",1);
                 i += utf8NextCharLen(l->buf, i, l->len);
             }
+        } else if (colorizeCallback) {
+            char colorized[16384];
+            size_t colorized_len = 0;
+            colorizeCallback(l->buf, colorized, sizeof(colorized), &colorized_len);
+            abAppend(&ab, colorized, colorized_len);
         } else {
             abAppend(&ab,l->buf,l->len);
         }
@@ -1057,6 +1135,9 @@ static void refreshMultiLine(struct linenoiseState *l, int flags) {
     lndebug("\n");
     l->oldpos = l->pos;
     if (flags & REFRESH_WRITE) l->oldrpos = rpos2;
+
+    /* Synchronized rendering: end. */
+    abAppend(&ab,"\x1b[?2026l",8);
 
     if (write(fd,ab.b,ab.len) == -1) {} /* Can't recover from write error. */
     abFree(&ab);
@@ -1106,8 +1187,8 @@ int linenoiseEditInsert(struct linenoiseState *l, const char *c, size_t clen) {
             l->len += clen;
             l->buf[l->len] = '\0';
             if ((!mlmode &&
-                 utf8StrWidth(l->prompt,l->plen)+utf8StrWidth(l->buf,l->len) < l->cols &&
-                 !hintsCallback)) {
+                 l->pwidthDisplay+utf8StrWidth(l->buf,l->len) < l->cols &&
+                 !hintsCallback && !colorizeCallback)) {
                 /* Avoid a full update of the line in the trivial case:
                  * single-width char, no hints, fits in one line. */
                 if (maskmode == 1) {
@@ -1266,6 +1347,7 @@ int linenoiseEditStart(struct linenoiseState *l, int stdin_fd, int stdout_fd, ch
     l->buflen = buflen;
     l->prompt = prompt;
     l->plen = strlen(prompt);
+    l->pwidthDisplay = utf8StrWidthAnsi(prompt, l->plen);
     l->oldpos = l->pos = 0;
     l->len = 0;
 
